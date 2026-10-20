@@ -1,0 +1,599 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Claude Gateway Server — one command, both gateways, localhost only.
+#
+#  FreeLLMAPI  -> http://127.0.0.1:3001   (OpenAI + Anthropic wire)
+#  OmniRoute   -> http://127.0.0.1:20128  (375 providers, combos)
+#
+#  Usage:
+#    ./server start              start both (installs on first run)
+#    ./server stop               stop both
+#    ./server restart
+#    ./server status             PID + health for both
+#    ./server logs [name] [-f]
+#    ./server test               live wire tests
+#    ./server connect [gateway]  write ~/.claude/settings.json
+#    ./server key [gateway]      show/set API keys
+#    ./server doctor             environment diagnostics
+#    ./server update             pull + rebuild
+#    ./server urls               print endpoints
+#
+#  Options for start:
+#    --freellmapi-only | --omniroute-only
+#
+#  Everything lives in ${CG_HOME:-$HOME/.claude-gateway}
+# =============================================================================
+set -Eeuo pipefail
+umask 077
+
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------- paths / env
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CG_HOME="${CG_HOME:-$HOME/.claude-gateway}"
+FREELMAPI_DIR="${FREELMAPI_DIR:-$CG_HOME/freellmapi}"
+OMNIROUTE_DATA="${OMNIROUTE_DATA:-$CG_HOME/omniroute-data}"
+CONFIG_FILE="$CG_HOME/config.env"
+SECRETS_FILE="$CG_HOME/secrets.env"
+LOG_DIR="$CG_HOME/logs"
+RUN_DIR="$CG_HOME/run"
+LOCK_DIR="$RUN_DIR/.lock"
+
+FREELMAPI_REPO="${FREELMAPI_REPO:-https://github.com/tashfeenahmed/freellmapi.git}"
+OMNIROUTE_PKG="${OMNIROUTE_PKG:-omniroute}"
+
+# node binaries (per-service override is useful for nvm / multiple runtimes)
+NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
+FREELMAPI_NODE="${FREELMAPI_NODE:-${NODE_BIN:-node}}"
+OMNIROUTE_NODE="${OMNIROUTE_NODE:-${NODE_BIN:-node}}"
+
+# ---------------------------------------------------------------- ui helpers
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_R=$'\033[0m'; C_B=$'\033[1m'; C_G=$'\033[32m'; C_Y=$'\033[33m'
+  C_C=$'\033[36m'; C_E=$'\033[31m'; C_D=$'\033[2m'
+else
+  C_R=''; C_B=''; C_G=''; C_Y=''; C_C=''; C_E=''; C_D=''
+fi
+
+say()  { printf '%s==>%s %s\n' "$C_C" "$C_R" "$*"; }
+ok()   { printf '%s  OK%s  %s\n' "$C_G" "$C_R" "$*"; }
+warn() { printf '%s WARN%s %s\n' "$C_Y" "$C_R" "$*" >&2; }
+die()  { printf '%sERROR%s %s\n' "$C_E" "$C_R" "$*" >&2; exit 1; }
+dim()  { printf '%s%s%s\n' "$C_D" "$*" "$C_R"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- primitives
+gen_hex() {
+  if have openssl; then openssl rand -hex 32
+  else "$NODE_BIN" -e 'console.log(require("crypto").randomBytes(32).toString("hex"))'; fi
+}
+
+gen_password() {
+  if have openssl; then openssl rand -base64 24 | tr -d '\n+/=' | cut -c1-24
+  else "$NODE_BIN" -e 'const c=require("crypto");let s="";const a="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";for(let i=0;i<24;i++)s+=a[c.randomInt(a.length)];console.log(s)'; fi
+}
+
+port_in_use() {
+  local port="$1"
+  "$NODE_BIN" -e '
+    const net=require("net");
+    const s=net.connect({host:"127.0.0.1",port:+process.argv[1]});
+    s.setTimeout(600);
+    s.on("connect",()=>{s.destroy();process.exit(0)});
+    s.on("timeout",()=>{s.destroy();process.exit(1)});
+    s.on("error",()=>process.exit(1));
+  ' "$port" >/dev/null 2>&1
+}
+
+pid_alive() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+read_pid() {
+  local f="$RUN_DIR/$1.pid"
+  [ -f "$f" ] && tr -dc '0-9' <"$f" || true
+}
+
+is_ours() {
+  # guard against PID reuse. Prefer our own env marker because Next.js
+  # rewrites the process title to "next-server (vX)".
+  local pid="$1" marker="$2"
+  if [ -r "/proc/$pid/environ" ]; then
+    if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx "CG_SERVICE=$marker"; then
+      return 0
+    fi
+  fi
+  [ -r "/proc/$pid/cmdline" ] || return 0   # non-Linux: trust the pid file
+  tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q "$marker"
+}
+
+version_ge() { # version_ge <actual> <min>
+  "$NODE_BIN" -e '
+    const a=process.argv[1].split(".").map(Number);
+    const b=process.argv[2].split(".").map(Number);
+    for(let i=0;i<3;i++){ if((a[i]||0)>(b[i]||0)) process.exit(0);
+      if((a[i]||0)<(b[i]||0)) process.exit(1); }
+    process.exit(0);
+  ' "$1" "$2"
+}
+
+node_ver() { "$1" -v 2>/dev/null | sed 's/^v//'; }
+
+wait_http() { # wait_http <url> <seconds> <name>
+  local url="$1" secs="$2" name="$3" i=0
+  while [ "$i" -lt "$secs" ]; do
+    if "$NODE_BIN" -e '
+      fetch(process.argv[1],{signal:AbortSignal.timeout(1500)})
+        .then(r=>process.exit(r.status<500?0:1))
+        .catch(()=>process.exit(1));
+    ' "$url" >/dev/null 2>&1; then return 0; fi
+    sleep 1; i=$((i+1))
+  done
+  return 1
+}
+
+take_lock() {
+  [ "${LOCK_HELD:-0}" = "1" ] && return 0
+  mkdir -p "$RUN_DIR"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    die "another server operation is running (lock: $LOCK_DIR). Agar stale hai to: rm -rf '$LOCK_DIR'"
+  fi
+  LOCK_HELD=1
+  trap 'release_lock' EXIT
+}
+
+release_lock() {
+  if [ "${LOCK_HELD:-0}" = "1" ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=0
+  fi
+}
+
+trap_cleanup() { release_lock; }
+
+# ---------------------------------------------------------------- config
+ensure_layout() {
+  mkdir -p "$CG_HOME" "$LOG_DIR" "$RUN_DIR"
+  chmod 700 "$CG_HOME" "$LOG_DIR" "$RUN_DIR" 2>/dev/null || true
+  [ -f "$CONFIG_FILE" ] || {
+    cat >"$CONFIG_FILE" <<EOF
+# Claude Gateway Server config — edit then restart.
+FREELMAPI_PORT=${FREELMAPI_PORT:-3001}
+OMNIROUTE_PORT=${OMNIROUTE_PORT:-20128}
+# Bind address is intentionally localhost only. Change only if you know why.
+BIND_HOST=127.0.0.1
+EOF
+    chmod 600 "$CONFIG_FILE"
+  }
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+  FREELMAPI_PORT="${FREELMAPI_PORT:-3001}"
+  OMNIROUTE_PORT="${OMNIROUTE_PORT:-20128}"
+  BIND_HOST="${BIND_HOST:-127.0.0.1}"
+}
+
+ensure_secrets() {
+  local created=0
+  [ -f "$SECRETS_FILE" ] || { : >"$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"; created=1; }
+  # shellcheck disable=SC1090
+  . "$SECRETS_FILE"
+
+  if [ -z "${FREELLMAPI_ENCRYPTION_KEY:-}" ]; then
+    FREELLMAPI_ENCRYPTION_KEY="$(gen_hex)"
+    printf 'FREELLMAPI_ENCRYPTION_KEY=%s\n' "$FREELLMAPI_ENCRYPTION_KEY" >>"$SECRETS_FILE"
+    created=1
+  fi
+  if [ -z "${OMNIROUTE_INITIAL_PASSWORD:-}" ]; then
+    OMNIROUTE_INITIAL_PASSWORD="$(gen_password)"
+    printf 'OMNIROUTE_INITIAL_PASSWORD=%s\n' "$OMNIROUTE_INITIAL_PASSWORD" >>"$SECRETS_FILE"
+    created=1
+  fi
+  if [ "$created" = 1 ]; then
+    chmod 600 "$SECRETS_FILE"
+    printf '\n%sOmniRoute dashboard password:%s %s\n' "$C_B" "$C_R" "$OMNIROUTE_INITIAL_PASSWORD"
+    printf '%s(saved in %s — chmod 600)%s\n\n' "$C_D" "$SECRETS_FILE" "$C_R"
+  fi
+}
+
+# ---------------------------------------------------------------- freellmapi
+start_freellmapi() {
+  local name="FreeLLMAPI" pid log="$LOG_DIR/freellmapi.log"
+
+  say "Preparing $name..."
+  have git >/dev/null || die "git chahiye: https://git-scm.com/downloads"
+
+  if [ ! -d "$FREELMAPI_DIR/.git" ]; then
+    say "  cloning into $FREELMAPI_DIR"
+    git clone --depth 1 "$FREELMAPI_REPO" "$FREELMAPI_DIR"
+  fi
+
+  local major
+  major="$(node_ver "$FREELMAPI_NODE" | cut -d. -f1)"
+  [ "${major:-0}" -ge 20 ] || die "FreeLLMAPI ko Node >= 20 chahiye (mila: $(node_ver "$FREELMAPI_NODE"))"
+
+  if [ ! -d "$FREELMAPI_DIR/node_modules" ]; then
+    say "  npm install (pehli baar, 5-15 min)"
+    ( cd "$FREELMAPI_DIR" && "$NODE_BIN" "$(command -v npm)" install --no-audit --no-fund )
+  fi
+
+  if [ ! -f "$FREELMAPI_DIR/.env" ]; then
+    cat >"$FREELMAPI_DIR/.env" <<EOF
+ENCRYPTION_KEY=$FREELLMAPI_ENCRYPTION_KEY
+PORT=$FREELMAPI_PORT
+HOST=$BIND_HOST
+EOF
+    chmod 600 "$FREELMAPI_DIR/.env"
+  fi
+
+  if [ ! -f "$FREELMAPI_DIR/server/dist/index.js" ]; then
+    say "  building server"
+    ( cd "$FREELMAPI_DIR" && npm run build -w server >/dev/null )
+  fi
+  if [ ! -f "$FREELMAPI_DIR/client/dist/index.html" ]; then
+    say "  building dashboard (2-5 min)"
+    ( cd "$FREELMAPI_DIR" && npm run build -w client >/dev/null )
+  fi
+
+  pid="$(read_pid freellmapi)"
+  if pid_alive "$pid" && is_ours "$pid" "freellmapi"; then
+    ok "$name already running (pid $pid)"
+    return 0
+  fi
+  if port_in_use "$FREELMAPI_PORT"; then
+    warn "$name: port $FREELMAPI_PORT already in use by another process — skipping"
+    return 1
+  fi
+
+  say "  starting on http://$BIND_HOST:$FREELMAPI_PORT"
+  ( cd "$FREELMAPI_DIR" && exec nohup env CG_SERVICE=freellmapi "$FREELMAPI_NODE" server/dist/index.js ) \
+    < /dev/null >"$log" 2>&1 &
+  pid=$!
+  echo "$pid" >"$RUN_DIR/freellmapi.pid"
+
+  if ! wait_http "http://127.0.0.1:$FREELMAPI_PORT/api/ping" 120 "$name"; then
+    echo; tail -n 25 "$log" >&2 || true
+    kill "$pid" 2>/dev/null || true
+    rm -f "$RUN_DIR/freellmapi.pid"
+    die "$name start nahi hua (log: $log)"
+  fi
+  ok "$name  http://127.0.0.1:$FREELMAPI_PORT  (pid $pid)"
+}
+
+# ---------------------------------------------------------------- omniroute
+find_omniroute_app() {
+  local p
+  for p in \
+    "${OMNIROUTE_APP:-}" \
+    "$CG_HOME/omniroute/node_modules/omniroute/app" \
+    "$(npm root -g 2>/dev/null || true)/omniroute/app"
+  do
+    [ -n "$p" ] && [ -f "$p/server.js" ] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+
+check_omniroute_node() {
+  local v; v="$(node_ver "$OMNIROUTE_NODE")"
+  [ -n "$v" ] || die "Node nahi mila (OMNIROUTE_NODE=$OMNIROUTE_NODE)"
+  if ! version_ge "$v" "22.22.2"; then
+    if [ "${CG_ALLOW_UNSUPPORTED_NODE:-0}" = "1" ]; then
+      warn "Node $v < 22.22.2 — unsupported, aage badh rahe hain (CG_ALLOW_UNSUPPORTED_NODE=1)"
+    else
+      die "OmniRoute ko Node >= 22.22.2 ya 24 LTS chahiye (mila: $v).
+      Fix:  nvm install 24 && nvm use 24
+      Ya:   OMNIROUTE_NODE=/path/to/node24 ./server start"
+    fi
+  fi
+}
+
+start_omniroute() {
+  local name="OmniRoute" pid log="$LOG_DIR/omniroute.log" app
+
+  check_omniroute_node
+
+  if ! app="$(find_omniroute_app)"; then
+    say "$name install ho raha hai (npm, ~460 MB — ek baar)"
+    mkdir -p "$CG_HOME/omniroute"
+    npm install --prefix "$CG_HOME/omniroute" "$OMNIROUTE_PKG" --no-audit --no-fund
+    app="$(find_omniroute_app)" || die "$name install ke baad bhi nahi mila"
+  fi
+
+  pid="$(read_pid omniroute)"
+  if pid_alive "$pid" && is_ours "$pid" "omniroute"; then
+    ok "$name already running (pid $pid)"
+    return 0
+  fi
+  if port_in_use "$OMNIROUTE_PORT"; then
+    warn "$name: port $OMNIROUTE_PORT already in use by another process — skipping"
+    return 1
+  fi
+
+  mkdir -p "$OMNIROUTE_DATA"
+  say "  starting on http://$BIND_HOST:$OMNIROUTE_PORT"
+  ( cd "$app" && exec nohup env \
+      CG_SERVICE=omniroute \
+      NODE_ENV=production \
+      HOSTNAME="$BIND_HOST" \
+      PORT="$OMNIROUTE_PORT" \
+      DATA_DIR="$OMNIROUTE_DATA" \
+      INITIAL_PASSWORD="$OMNIROUTE_INITIAL_PASSWORD" \
+      "$OMNIROUTE_NODE" server.js ) \
+    < /dev/null >"$log" 2>&1 &
+  pid=$!
+  echo "$pid" >"$RUN_DIR/omniroute.pid"
+
+  if ! wait_http "http://127.0.0.1:$OMNIROUTE_PORT/api/init" 180 "$name"; then
+    echo; tail -n 25 "$log" >&2 || true
+    kill "$pid" 2>/dev/null || true
+    rm -f "$RUN_DIR/omniroute.pid"
+    die "$name start nahi hua (log: $log)"
+  fi
+  ok "$name   http://127.0.0.1:$OMNIROUTE_PORT  (pid $pid)"
+}
+
+# ---------------------------------------------------------------- commands
+stop_one() {
+  local key="$1" label="$2" marker="$3" pid
+  pid="$(read_pid "$key")"
+  if ! pid_alive "$pid"; then
+    rm -f "$RUN_DIR/$key.pid"
+    dim "  $label: not running"
+    return 0
+  fi
+  if ! is_ours "$pid" "$marker"; then
+    warn "$label: pid $pid does not look like $label — pid file hata rahe hain, process nahi"
+    rm -f "$RUN_DIR/$key.pid"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  local i=0
+  while [ "$i" -lt 20 ] && pid_alive "$pid"; do sleep 0.5; i=$((i+1)); done
+  if pid_alive "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+  rm -f "$RUN_DIR/$key.pid"
+  ok "$label stopped"
+}
+
+http_code() {
+  "$NODE_BIN" -e '
+    fetch(process.argv[1],{signal:AbortSignal.timeout(1500)})
+      .then(r=>{console.log(r.status);process.exit(0)})
+      .catch(()=>{console.log("000");process.exit(0)});
+  ' "$1" 2>/dev/null || echo 000
+}
+
+cmd_start() {
+  local only="${1:-both}"
+  ensure_layout; ensure_secrets; take_lock
+  trap trap_cleanup EXIT
+
+  say "Claude Gateway Server v$VERSION"
+  dim "  home: $CG_HOME"
+
+  local rc=0
+  if [ "$only" != "omniroute" ]; then start_freellmapi || rc=1; fi
+  if [ "$only" != "freellmapi" ]; then start_omniroute || rc=1; fi
+
+  echo
+  printf '%s  Dashboards%s\n' "$C_B" "$C_R"
+  [ "$only" != "omniroute" ] && printf '    FreeLLMAPI   %shttp://127.0.0.1:%s%s\n' "$C_C" "$FREELMAPI_PORT" "$C_R"
+  [ "$only" != "freellmapi" ] && printf '    OmniRoute    %shttp://127.0.0.1:%s%s\n' "$C_C" "$OMNIROUTE_PORT" "$C_R"
+  echo
+  cat <<EOF
+Next steps:
+  1. FreeLLMAPI dashboard -> account banao -> Keys -> provider keys + unified key
+  2. OmniRoute dashboard  -> login (password ${SECRETS_FILE}) -> Providers -> Endpoints key
+  3. Claude Code:  ./server connect freellmapi     (ya: omniroute)
+  4. Verify:       ./server test
+  5. Stop:         ./server stop
+
+EOF
+  return "$rc"
+}
+
+cmd_stop() {
+  ensure_layout; take_lock; trap trap_cleanup EXIT
+  say "Stopping gateways..."
+  stop_one freellmapi "FreeLLMAPI" "freellmapi"
+  stop_one omniroute "OmniRoute" "omniroute"
+}
+
+cmd_status() {
+  ensure_layout
+  printf '\n%-12s %-8s %-7s %-26s %s\n' "SERVICE" "PID" "PORT" "URL" "HEALTH"
+  printf '%-12s %-8s %-7s %-26s %s\n' "------------" "--------" "-------" "--------------------------" "------"
+
+  local pid state
+  pid="$(read_pid freellmapi)"
+  if pid_alive "$pid"; then state="$(http_code "http://127.0.0.1:$FREELMAPI_PORT/api/ping")"; else state="down"; fi
+  printf '%-12s %-8s %-7s %-26s %s\n' "FreeLLMAPI" "${pid:--}" "$FREELMAPI_PORT" "http://127.0.0.1:$FREELMAPI_PORT" \
+    "$( [ "$state" = 200 ] && printf '%sUP%s' "$C_G" "$C_R" || printf '%s%s%s' "$C_E" "$state" "$C_R" )"
+
+  pid="$(read_pid omniroute)"
+  if pid_alive "$pid"; then state="$(http_code "http://127.0.0.1:$OMNIROUTE_PORT/api/init")"; else state="down"; fi
+  printf '%-12s %-8s %-7s %-26s %s\n' "OmniRoute" "${pid:--}" "$OMNIROUTE_PORT" "http://127.0.0.1:$OMNIROUTE_PORT" \
+    "$( [ "$state" = 200 ] && printf '%sUP%s' "$C_G" "$C_R" || printf '%s%s%s' "$C_E" "$state" "$C_R" )"
+  echo
+}
+
+cmd_logs() {
+  ensure_layout
+  local svc="${1:-}" extra="${2:-}"
+  case "$svc" in
+    freellmapi|FreeLLMAPI|free) svc=freellmapi ;;
+    omniroute|OmniRoute|omni)   svc=omniroute ;;
+    "" ) tail -n 40 "$LOG_DIR/freellmapi.log" "$LOG_DIR/omniroute.log" 2>/dev/null; return 0 ;;
+    * ) die "logs: freellmapi | omniroute" ;;
+  esac
+  if [ "$extra" = "-f" ]; then tail -n 40 -f "$LOG_DIR/$svc.log"; else tail -n 120 "$LOG_DIR/$svc.log"; fi
+}
+
+freellmapi_key() {
+  [ -f "$FREELMAPI_DIR/server/data/freeapi.db" ] || return 1
+  "$NODE_BIN" "$ROOT/scripts/read-freellmapi-key.mjs" \
+    "$FREELMAPI_DIR" "$FREELMAPI_DIR/server/data/freeapi.db" 2>/dev/null
+}
+
+cmd_test() {
+  ensure_layout; ensure_secrets
+  local fail=0 key
+  say "Health checks"
+  port_in_use "$FREELMAPI_PORT" && ok "FreeLLMAPI port $FREELMAPI_PORT open" || { warn "FreeLLMAPI port $FREELMAPI_PORT closed"; fail=1; }
+  port_in_use "$OMNIROUTE_PORT" && ok "OmniRoute port $OMNIROUTE_PORT open" || { warn "OmniRoute port $OMNIROUTE_PORT closed"; fail=1; }
+
+  key="$(freellmapi_key || true)"
+  if [ -n "$key" ]; then
+    echo; say "FreeLLMAPI wire tests"
+    TEST_TIMEOUT_MS="${TEST_TIMEOUT_MS:-90000}" \
+      "$NODE_BIN" "$ROOT/scripts/test-gateway.mjs" "http://127.0.0.1:$FREELMAPI_PORT" "$key" "${FREELMAPI_MODEL:-auto}" || fail=1
+  else
+    warn "FreeLLMAPI unified key nahi mili (dashboard -> Keys se copy karo)"
+  fi
+
+  if [ -n "${OMNIROUTE_API_KEY:-}" ]; then
+    echo; say "OmniRoute wire tests"
+    TEST_TIMEOUT_MS="${TEST_TIMEOUT_MS:-90000}" \
+      "$NODE_BIN" "$ROOT/scripts/test-gateway.mjs" "http://127.0.0.1:$OMNIROUTE_PORT" "$OMNIROUTE_API_KEY" "${OMNIROUTE_MODEL:-auto}" || fail=1
+  else
+    dim "  OmniRoute API key set nahi hai — dashboard -> Endpoints se banao, phir:"
+    dim "  ./server key omniroute sk-..."
+  fi
+  return "$fail"
+}
+
+cmd_connect() {
+  ensure_layout; ensure_secrets
+  local gw="${1:-freellmapi}" key="${2:-}" model="${3:-auto}"
+  case "$gw" in
+    freellmapi|free)
+      key="${key:-$(freellmapi_key || true)}"
+      [ -n "$key" ] || die "FreeLLMAPI key nahi mili. Dashboard -> Keys se unified key lo, phir: ./server connect freellmapi freellmapi-..."
+      exec "$ROOT/scripts/connect-claude.sh" "http://127.0.0.1:$FREELMAPI_PORT" "$key" "$model"
+      ;;
+    omniroute|omni)
+      [ -n "$key" ] || key="${OMNIROUTE_API_KEY:-}"
+      [ -n "$key" ] || die "OmniRoute key do: ./server connect omniroute sk-..."
+      exec "$ROOT/scripts/connect-claude.sh" "http://127.0.0.1:$OMNIROUTE_PORT" "$key" "$model"
+      ;;
+    *) die "connect: freellmapi | omniroute" ;;
+  esac
+}
+
+cmd_key() {
+  ensure_layout; ensure_secrets
+  local gw="${1:-}"
+  case "$gw" in
+    freellmapi|free)
+      local k; k="$(freellmapi_key || true)"
+      [ -n "$k" ] || die "key nahi mili — FreeLLMAPI dashboard -> Keys"
+      printf '%s\n' "$k"
+      ;;
+    omniroute|omni)
+      if [ -n "${2:-}" ]; then
+        if grep -q '^OMNIROUTE_API_KEY=' "$SECRETS_FILE" 2>/dev/null; then
+          sed -i.bak "s|^OMNIROUTE_API_KEY=.*|OMNIROUTE_API_KEY=$2|" "$SECRETS_FILE" && rm -f "$SECRETS_FILE.bak"
+        else
+          printf 'OMNIROUTE_API_KEY=%s\n' "$2" >>"$SECRETS_FILE"
+        fi
+        chmod 600 "$SECRETS_FILE"
+        ok "OmniRoute key saved to $SECRETS_FILE"
+      else
+        [ -n "${OMNIROUTE_API_KEY:-}" ] && printf '%s\n' "$OMNIROUTE_API_KEY" || die "key set nahi — ./server key omniroute sk-..."
+      fi
+      ;;
+    *) die "key: freellmapi | omniroute [sk-...]" ;;
+  esac
+}
+
+cmd_doctor() {
+  ensure_layout
+  echo
+  printf '%sClaude Gateway Server %s — doctor%s\n\n' "$C_B" "$VERSION" "$C_R"
+  printf '  home            %s\n' "$CG_HOME"
+  printf '  node (default)  %s  (%s)\n' "$(node_ver "$NODE_BIN" || echo missing)" "$NODE_BIN"
+  printf '  node (freellmapi) %s\n' "$(node_ver "$FREELMAPI_NODE" || echo missing)"
+  printf '  node (omniroute)  %s\n' "$(node_ver "$OMNIROUTE_NODE" || echo missing)"
+  printf '  npm             %s\n' "$(npm -v 2>/dev/null || echo missing)"
+  printf '  git             %s\n' "$(git --version 2>/dev/null | awk '{print $3}' || echo missing)"
+  printf '  docker          %s\n' "$(docker --version 2>/dev/null | awk '{print $3}' | tr -d , || echo "not installed (optional)")"
+  echo
+  printf '  FreeLLMAPI      %s\n' "$( [ -f "$FREELMAPI_DIR/server/dist/index.js" ] && echo "installed ($FREELMAPI_DIR)" || echo "not installed yet" )"
+  local app; app="$(find_omniroute_app || true)"
+  printf '  OmniRoute       %s\n' "${app:-not installed yet}"
+  printf '  secrets         %s\n' "$( [ -f "$SECRETS_FILE" ] && stat -c '%a' "$SECRETS_FILE" 2>/dev/null || echo missing )"
+  echo
+  for p in "$FREELMAPI_PORT" "$OMNIROUTE_PORT"; do
+    if port_in_use "$p"; then ok "port $p in use (gateway running?)"; else dim "  port $p free"; fi
+  done
+  echo
+  cmd_status
+}
+
+cmd_update() {
+  ensure_layout; take_lock; trap trap_cleanup EXIT
+  if [ -d "$FREELMAPI_DIR/.git" ]; then
+    say "Updating FreeLLMAPI"
+    ( cd "$FREELMAPI_DIR" && git pull --ff-only && npm install --no-audit --no-fund \
+        && npm run build -w server && npm run build -w client )
+  fi
+  if find_omniroute_app >/dev/null; then
+    say "Updating OmniRoute"
+    if npm ls -g "$OMNIROUTE_PKG" >/dev/null 2>&1; then
+      npm install -g "$OMNIROUTE_PKG" --no-audit --no-fund
+    else
+      npm install --prefix "$CG_HOME/omniroute" "$OMNIROUTE_PKG" --no-audit --no-fund
+    fi
+  fi
+  cmd_stop
+  cmd_start
+}
+
+cmd_urls() {
+  ensure_layout
+  cat <<EOF
+FreeLLMAPI
+  dashboard   http://127.0.0.1:${FREELMAPI_PORT}
+  OpenAI      http://127.0.0.1:${FREELMAPI_PORT}/v1
+  Anthropic   http://127.0.0.1:${FREELMAPI_PORT}
+
+OmniRoute
+  dashboard   http://127.0.0.1:${OMNIROUTE_PORT}
+  OpenAI      http://127.0.0.1:${OMNIROUTE_PORT}/v1
+  Anthropic   http://127.0.0.1:${OMNIROUTE_PORT}
+EOF
+}
+
+usage() {
+  sed -n '2,80p' "$ROOT/server" | grep '^#' | sed 's/^# \{0,1\}//'
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    start)
+      local only=both
+      case "${1:-}" in
+        --freellmapi-only) only=freellmapi ;;
+        --omniroute-only)  only=omniroute ;;
+        "") ;;
+        *) die "start: unknown option ${1}" ;;
+      esac
+      cmd_start "$only" ;;
+    stop)    cmd_stop ;;
+    restart) cmd_stop; cmd_start "both" ;;
+    status)  cmd_status ;;
+    logs)    cmd_logs "${1:-}" "${2:-}" ;;
+    test)    cmd_test ;;
+    connect) cmd_connect "${1:-freellmapi}" "${2:-}" "${3:-auto}" ;;
+    key)     cmd_key "${1:-}" "${2:-}" ;;
+    doctor)  cmd_doctor ;;
+    update)  cmd_update ;;
+    urls)    cmd_urls ;;
+    version|--version|-v) echo "claude-gateway-server $VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"

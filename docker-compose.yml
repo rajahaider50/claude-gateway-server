@@ -1,0 +1,40 @@
+# Dono gateways ek saath (optional). Sirf ek chahiye to doosra comment kar do.
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Ports: FreeLLMAPI -> 3001, OmniRoute -> 20128
+# Dono default par sirf 127.0.0.1 par bind hote hain (safe).
+
+services:
+  freellmapi:
+    image: ghcr.io/tashfeenahmed/freellmapi:latest
+    container_name: freellmapi
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      ENCRYPTION_KEY: ${FREELLMAPI_ENCRYPTION_KEY}
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - freellmapi-data:/app/server/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  omniroute:
+    image: diegosouzapw/omniroute:latest
+    container_name: omniroute
+    environment:
+      PORT: 20128
+      INITIAL_PASSWORD: ${OMNIROUTE_INITIAL_PASSWORD}
+      JWT_SECRET: ${OMNIROUTE_JWT_SECRET}
+      API_KEY_SECRET: ${OMNIROUTE_API_KEY_SECRET}
+    ports:
+      - "127.0.0.1:20128:20128"
+    volumes:
+      - omniroute-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  freellmapi-data:
+  omniroute-data:

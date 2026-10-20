@@ -1,0 +1,22 @@
+# runtime / generated
+.runtime/
+.claude-gateway/
+node_modules/
+*.log
+logs/
+run/
+data/
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+secrets.env
+config.env
+settings.json
+
+# test artifacts
+/tmp/
+.DS_Store
+*.bak
+*.bak-*
