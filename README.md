@@ -367,6 +367,7 @@ Ek hi provider par depend mat raho — dono gateways fallback ke liye bane hain.
 
 | Error | Fix |
 |---|---|
+| `./server: line 69: : command not found` | Node.js install nahi hai ya PATH mein nahi. `node -v` check karo; Termux: `pkg install nodejs-lts git openssl` |
 | `better-sqlite3` "NODE_MODULE_VERSION 115 vs 127" | `npm rebuild better-sqlite3` (new Node se), ya wahi Node version use karo jisse install kiya |
 | `libdl.so: cannot open shared object file` (Termux/Android) | glibc toolchain wale Node se rebuild karo: `CC=gcc CXX=g++ npm rebuild better-sqlite3 --build-from-source` |
 | OmniRoute `e.util.markAsUncloneable is not a function` | Node 22.22.2+ / 24 LTS use karo (purane patch builds mein API missing hoti hai) |

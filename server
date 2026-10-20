@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # ---------------------------------------------------------------- paths / env
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,9 +43,28 @@ FREELMAPI_REPO="${FREELMAPI_REPO:-https://github.com/tashfeenahmed/freellmapi.gi
 OMNIROUTE_PKG="${OMNIROUTE_PKG:-omniroute}"
 
 # node binaries (per-service override is useful for nvm / multiple runtimes)
-NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
-FREELMAPI_NODE="${FREELMAPI_NODE:-${NODE_BIN:-node}}"
-OMNIROUTE_NODE="${OMNIROUTE_NODE:-${NODE_BIN:-node}}"
+find_node() {
+  local c
+  for c in \
+    "${NODE_BIN:-}" \
+    "$(command -v node 2>/dev/null || true)" \
+    /usr/local/bin/node \
+    /usr/bin/node \
+    /opt/homebrew/bin/node \
+    /opt/node24/bin/node /opt/node22/bin/node \
+    "${PREFIX:-/nonexistent}/bin/node" \
+    /data/data/com.termux/files/usr/bin/node \
+    "$HOME"/.nvm/versions/node/*/bin/node \
+    "$HOME"/.local/share/fnm/node-versions/*/installation/bin/node
+  do
+    [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+NODE_BIN="${NODE_BIN:-$(find_node || true)}"
+FREELMAPI_NODE="${FREELMAPI_NODE:-${NODE_BIN}}"
+OMNIROUTE_NODE="${OMNIROUTE_NODE:-${NODE_BIN}}"
 
 # ---------------------------------------------------------------- ui helpers
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -66,12 +85,19 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # ---------------------------------------------------------------- primitives
 gen_hex() {
   if have openssl; then openssl rand -hex 32
-  else "$NODE_BIN" -e 'console.log(require("crypto").randomBytes(32).toString("hex"))'; fi
+  elif have od; then od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n'; echo
+  elif have xxd; then xxd -l 32 -p /dev/urandom
+  else die "secrets banane ke liye openssl ya od/xxd chahiye (Termux: pkg install openssl)"; fi
 }
 
 gen_password() {
-  if have openssl; then openssl rand -base64 24 | tr -d '\n+/=' | cut -c1-24
-  else "$NODE_BIN" -e 'const c=require("crypto");let s="";const a="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";for(let i=0;i<24;i++)s+=a[c.randomInt(a.length)];console.log(s)'; fi
+  if have openssl; then
+    openssl rand -base64 48 | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c1-24
+  elif [ -r /dev/urandom ]; then
+    dd if=/dev/urandom bs=128 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c1-24
+  else
+    die "password generate nahi ho saka (openssl ya /dev/urandom chahiye)"
+  fi
 }
 
 port_in_use() {
@@ -119,7 +145,44 @@ version_ge() { # version_ge <actual> <min>
   ' "$1" "$2"
 }
 
-node_ver() { "$1" -v 2>/dev/null | sed 's/^v//'; }
+node_ver() { [ -n "${1:-}" ] && "$1" -v 2>/dev/null | sed 's/^v//' || true; }
+
+require_node() {
+  if [ -z "${NODE_BIN:-}" ] || ! "$NODE_BIN" -v >/dev/null 2>&1; then
+    printf '\n%sERROR%s Node.js nahi mila (ya PATH mein nahi hai).\n\n' "$C_E" "$C_R" >&2
+    if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux ]; then
+      cat >&2 <<'EOF'
+Termux par install karo:
+  pkg update && pkg install nodejs-lts git openssl
+EOF
+    elif [ "$(uname -s 2>/dev/null || true)" = "Darwin" ]; then
+      cat >&2 <<'EOF'
+macOS par install karo (ek chuno):
+  brew install node@24
+  ya nvm: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash && nvm install 24
+EOF
+    else
+      cat >&2 <<'EOF'
+Install karo (ek chuno):
+  Debian/Ubuntu:  curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash - && sudo apt install -y nodejs
+  Fedora:         sudo dnf install nodejs npm
+  Arch:           sudo pacman -S nodejs npm
+  nvm (any distro): curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash && nvm install 24
+EOF
+    fi
+    printf '\nInstall ke baad dobara: %s./server start%s\n' "$C_B" "$C_R" >&2
+    exit 1
+  fi
+
+  local v major
+  v="$(node_ver "$NODE_BIN")"
+  major="${v%%.*}"
+  if [ "${major:-0}" -lt 20 ]; then
+    die "Node $v mila, lekin kam se kam Node 20 chahiye (recommended: 24 LTS).
+      nvm install 24 && nvm use 24
+      ya: NODE_BIN=/path/to/node24 ./server start"
+  fi
+}
 
 wait_http() { # wait_http <url> <seconds> <name>
   local url="$1" secs="$2" name="$3" i=0
@@ -570,6 +633,9 @@ usage() {
 
 main() {
   local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    start|stop|restart|status|test|connect|key|doctor|update) require_node ;;
+  esac
   case "$cmd" in
     start)
       local only=both
