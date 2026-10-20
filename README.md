@@ -28,6 +28,7 @@ Pehli baar ye khud hi:
 ./server connect freellmapi     # Claude Code ko gateway se jodo
 ./server stop                   # dono band
 ./server doctor                 # environment diagnose
+./server clean                  # adhoora install + npm cache saaf (space free)
 ```
 
 Sab kuch `~/.claude-gateway/` mein rehta hai — uninstall ke liye wahi folder delete karo.
@@ -367,6 +368,8 @@ Ek hi provider par depend mat raho — dono gateways fallback ke liye bane hain.
 
 | Error | Fix |
 |---|---|
+| `ENOSPC: no space left on device` (OmniRoute install) | ~3 GB free chahiye. `./server clean` chalao (adhoora install + npm cache delete), phir `./server start` |
+| `OmniRoute install ke baad app/server.js nahi mila` | Adhoora/partial install. `./server clean` phir `./server start` (script ab khud partial install detect karke clean karta hai) |
 | `./server: line 69: : command not found` | Node.js install nahi hai ya PATH mein nahi. `node -v` check karo; Termux: `pkg install nodejs-lts git openssl` |
 | `better-sqlite3` "NODE_MODULE_VERSION 115 vs 127" | `npm rebuild better-sqlite3` (new Node se), ya wahi Node version use karo jisse install kiya |
 | `libdl.so: cannot open shared object file` (Termux/Android) | glibc toolchain wale Node se rebuild karo: `CC=gcc CXX=g++ npm rebuild better-sqlite3 --build-from-source` |

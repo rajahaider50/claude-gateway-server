@@ -15,6 +15,7 @@
 #    ./server connect [gateway]  write ~/.claude/settings.json
 #    ./server key [gateway]      show/set API keys
 #    ./server doctor             environment diagnostics
+#    ./server clean              partial installs + npm cache saaf karo
 #    ./server update             pull + rebuild
 #    ./server urls               print endpoints
 #
@@ -26,7 +27,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 
 # ---------------------------------------------------------------- paths / env
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -325,6 +326,13 @@ EOF
 }
 
 # ---------------------------------------------------------------- omniroute
+free_mb() {
+  local dir="${1:-$CG_HOME}" v
+  v="$(df -Pm "$dir" 2>/dev/null | awk 'NR==2{print $4}' || true)"
+  case "$v" in ''|*[!0-9]*) v="" ;; esac
+  printf '%s' "$v"
+}
+
 find_omniroute_app() {
   local p
   for p in \
@@ -335,6 +343,82 @@ find_omniroute_app() {
     [ -n "$p" ] && [ -f "$p/server.js" ] && { printf '%s' "$p"; return 0; }
   done
   return 1
+}
+
+# Install OmniRoute into $CG_HOME/omniroute and set OMNIROUTE_APP_PATH.
+install_omniroute() {
+  local prefix="$CG_HOME/omniroute"
+  local pkgdir="$prefix/node_modules/omniroute"
+  local log="$LOG_DIR/omniroute-install.log"
+  local need="${CG_MIN_FREE_MB:-3000}" have_mb post=""
+  local -a extra=()
+
+  mkdir -p "$prefix" "$LOG_DIR"
+
+  # Broken partial install (e.g. previous ENOSPC) must be removed first,
+  # warna npm usko reuse karke phir wahi incomplete tree bana deta hai.
+  if [ -d "$prefix" ] && [ ! -f "$pkgdir/app/server.js" ] && [ -n "$(ls -A "$prefix" 2>/dev/null || true)" ]; then
+    warn "OmniRoute ka adhoora install mila — poora saaf kar rahe hain"
+    rm -rf "$prefix"
+  fi
+  mkdir -p "$prefix"
+
+  have_mb="$(free_mb "$CG_HOME")"
+  if [ -n "$have_mb" ] && [ "$have_mb" -lt "$need" ] && [ "${CG_SKIP_DISK_CHECK:-0}" != "1" ]; then
+    cat >&2 <<EOF
+
+ERROR: Disk space kam hai.
+  Free    : ${have_mb} MB
+  Chahiye : ~${need} MB (OmniRoute unpack + app build)
+
+Space free karne ke liye:
+  npm cache clean --force
+  rm -rf "$prefix"
+  du -sh ~/.npm ~/.claude-gateway/* 2>/dev/null | sort -h
+
+Filhaal sirf FreeLLMAPI chala sakte ho:
+  ./server start --freellmapi-only
+
+Space banne ke baad:
+  ./server start
+EOF
+    exit 1
+  fi
+
+  say "OmniRoute install ho raha hai (npm, ~1.6 GB unpacked — ek baar, 10-25 min)"
+  ( cd "$prefix" && { [ -f package.json ] || npm init -y >/dev/null 2>&1; } )
+
+  # npm >= 11.17 asks for install-script approval; pre-approve the native ones.
+  if npm approve-scripts --help >/dev/null 2>&1; then
+    extra=(--allow-scripts=omniroute,esbuild,@swc/core,keytar,@parcel/watcher)
+  fi
+
+  if ! ( cd "$prefix" && npm install "$OMNIROUTE_PKG" --no-audit --no-fund \
+           --foreground-scripts "${extra[@]}" ) 2>&1 | tee "$log" | tail -n 3; then
+    tail -n 30 "$log" >&2 || true
+    die "OmniRoute install fail hua (log: $log)"
+  fi
+
+  if [ ! -f "$pkgdir/app/server.js" ]; then
+    for post in "$pkgdir/scripts/build/postinstall.mjs" "$pkgdir/scripts/postinstall.mjs"; do
+      [ -f "$post" ] && break
+    done
+    if [ -f "$post" ]; then
+      say "  app bundle missing — postinstall manually chala rahe hain"
+      if ! ( cd "$pkgdir" && "$OMNIROUTE_NODE" "$post" ) 2>&1 | tee -a "$log" | tail -n 3; then
+        tail -n 30 "$log" >&2 || true
+        die "OmniRoute postinstall fail hua (log: $log)"
+      fi
+    fi
+  fi
+
+  if [ ! -f "$pkgdir/app/server.js" ]; then
+    tail -n 30 "$log" >&2 || true
+    die "OmniRoute install ke baad app/server.js nahi mila (log: $log)
+      Shayad disk full ho gaya. 'df -h ~' dekho, phir './server clean' aur dobara './server start'."
+  fi
+
+  OMNIROUTE_APP_PATH="$pkgdir/app"
 }
 
 check_omniroute_node() {
@@ -357,10 +441,10 @@ start_omniroute() {
   check_omniroute_node
 
   if ! app="$(find_omniroute_app)"; then
-    say "$name install ho raha hai (npm, ~460 MB — ek baar)"
-    mkdir -p "$CG_HOME/omniroute"
-    npm install --prefix "$CG_HOME/omniroute" "$OMNIROUTE_PKG" --no-audit --no-fund
-    app="$(find_omniroute_app)" || die "$name install ke baad bhi nahi mila"
+    OMNIROUTE_APP_PATH=""
+    install_omniroute
+    app="$OMNIROUTE_APP_PATH"
+    [ -n "$app" ] || die "OmniRoute install ke baad app nahi mila"
   fi
 
   pid="$(read_pid omniroute)"
@@ -574,6 +658,7 @@ cmd_doctor() {
   echo
   printf '%sClaude Gateway Server %s — doctor%s\n\n' "$C_B" "$VERSION" "$C_R"
   printf '  home            %s\n' "$CG_HOME"
+  printf '  disk free       %s MB\n' "$(free_mb "$CG_HOME")"
   printf '  node (default)  %s  (%s)\n' "$(node_ver "$NODE_BIN" || echo missing)" "$NODE_BIN"
   printf '  node (freellmapi) %s\n' "$(node_ver "$FREELMAPI_NODE" || echo missing)"
   printf '  node (omniroute)  %s\n' "$(node_ver "$OMNIROUTE_NODE" || echo missing)"
@@ -593,6 +678,18 @@ cmd_doctor() {
   cmd_status
 }
 
+cmd_clean() {
+  ensure_layout
+  say "Partial installs / npm cache saaf kar rahe hain..."
+  rm -rf "$CG_HOME/omniroute"
+  ok "removed $CG_HOME/omniroute (agli start par fresh install hoga)"
+  if have npm; then
+    if npm cache clean --force >/dev/null 2>&1; then ok "npm cache cleared"; fi
+  fi
+  local f; f="$(free_mb "$CG_HOME")"
+  [ -n "$f" ] && ok "ab free space: ${f} MB" || true
+}
+
 cmd_update() {
   ensure_layout; take_lock; trap trap_cleanup EXIT
   if [ -d "$FREELMAPI_DIR/.git" ]; then
@@ -605,7 +702,7 @@ cmd_update() {
     if npm ls -g "$OMNIROUTE_PKG" >/dev/null 2>&1; then
       npm install -g "$OMNIROUTE_PKG" --no-audit --no-fund
     else
-      npm install --prefix "$CG_HOME/omniroute" "$OMNIROUTE_PKG" --no-audit --no-fund
+      install_omniroute
     fi
   fi
   cmd_stop
@@ -654,6 +751,7 @@ main() {
     connect) cmd_connect "${1:-freellmapi}" "${2:-}" "${3:-auto}" ;;
     key)     cmd_key "${1:-}" "${2:-}" ;;
     doctor)  cmd_doctor ;;
+    clean)   cmd_clean ;;
     update)  cmd_update ;;
     urls)    cmd_urls ;;
     version|--version|-v) echo "claude-gateway-server $VERSION" ;;
